@@ -1,0 +1,491 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import sqlite3
+from pathlib import Path
+import hashlib
+import os
+import shutil
+from datetime import datetime
+
+class AuthApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Sistema de Gestión de Usuarios y Archivos")
+        self.root.geometry("800x600")
+        self.root.configure(bg="#f0f2f5")
+
+        # Variables de sesión
+        self.current_user = None
+        
+        # Configurar la base de datos y directorios
+        self.db_path = 'data/users.db'
+        self.files_dir = 'data/user_files'
+        self.setup_database()
+        
+        # Variables
+        self.is_login = tk.BooleanVar(value=True)
+        self.email = tk.StringVar()
+        self.password = tk.StringVar()
+
+        # Crear interfaz
+        self.create_widgets()
+        
+        # Mostrar información de la base de datos
+        self.show_db_info()
+
+    def setup_database(self):
+        # Crear directorios necesarios
+        Path("data").mkdir(exist_ok=True)
+        Path(self.files_dir).mkdir(exist_ok=True)
+        
+        print(f"Creando/conectando base de datos en: {os.path.abspath(self.db_path)}")
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            # Tabla de usuarios
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            # Tabla de archivos
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    file_type TEXT NOT NULL,
+                    original_name TEXT NOT NULL,
+                    upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+                )
+            ''')
+            conn.commit()
+
+    def create_widgets(self):
+        # Frame principal
+        self.main_frame = ttk.Frame(self.root, padding="20")
+        self.main_frame.pack(expand=True, fill="both")
+
+        # Crear frames separados
+        self.login_frame = ttk.Frame(self.main_frame)
+        self.user_panel_frame = ttk.Frame(self.main_frame)
+        
+        self.create_login_widgets()
+        self.create_user_panel_widgets()
+        
+        # Mostrar frame de login inicialmente
+        self.show_login_frame()
+
+    def create_login_widgets(self):
+        # Estilo para los widgets
+        style = ttk.Style()
+        style.configure("TLabel", font=("Helvetica", 12))
+        style.configure("TEntry", font=("Helvetica", 11))
+        style.configure("TButton", font=("Helvetica", 11))
+
+        # Título
+        self.title_label = ttk.Label(
+            self.login_frame,
+            text="Iniciar Sesión",
+            font=("Helvetica", 20, "bold")
+        )
+        self.title_label.pack(pady=(0, 20))
+
+        # Email
+        ttk.Label(self.login_frame, text="Correo electrónico:").pack(anchor="w")
+        email_entry = ttk.Entry(self.login_frame, textvariable=self.email, width=40)
+        email_entry.pack(pady=(0, 15), fill="x")
+
+        # Contraseña
+        ttk.Label(self.login_frame, text="Contraseña:").pack(anchor="w")
+        password_entry = ttk.Entry(self.login_frame, textvariable=self.password, show="•", width=40)
+        password_entry.pack(pady=(0, 20), fill="x")
+
+        # Botón de acción
+        self.action_button = ttk.Button(
+            self.login_frame,
+            text="Iniciar Sesión",
+            command=self.handle_submit,
+            width=39
+        )
+        self.action_button.pack(pady=(0, 15))
+
+        # Botón para cambiar entre login y registro
+        self.toggle_button = ttk.Button(
+            self.login_frame,
+            text="¿No tienes una cuenta? Regístrate",
+            command=self.toggle_mode,
+            width=39
+        )
+        self.toggle_button.pack(pady=(0, 15))
+
+    def create_user_panel_widgets(self):
+        # Frame superior para información del usuario
+        top_frame = ttk.Frame(self.user_panel_frame)
+        top_frame.pack(fill="x", pady=(0, 20))
+        
+        self.user_label = ttk.Label(
+            top_frame,
+            text="",
+            font=("Helvetica", 14, "bold")
+        )
+        self.user_label.pack(side="left")
+        
+        ttk.Button(
+            top_frame,
+            text="Cerrar Sesión",
+            command=self.logout
+        ).pack(side="right")
+
+        # Frame para la gestión de archivos
+        files_frame = ttk.LabelFrame(self.user_panel_frame, text="Gestión de Archivos", padding="10")
+        files_frame.pack(fill="both", expand=True)
+
+        # Botones para subir archivos
+        buttons_frame = ttk.Frame(files_frame)
+        buttons_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Button(
+            buttons_frame,
+            text="Subir Imagen",
+            command=lambda: self.upload_file(['png', 'jpg', 'jpeg', 'gif'], 'imagen')
+        ).pack(side="left", padx=5)
+
+        ttk.Button(
+            buttons_frame,
+            text="Subir Texto",
+            command=lambda: self.upload_file(['txt', 'doc', 'docx'], 'texto')
+        ).pack(side="left", padx=5)
+
+        ttk.Button(
+            buttons_frame,
+            text="Subir Audio",
+            command=lambda: self.upload_file(['mp3', 'wav'], 'audio')
+        ).pack(side="left", padx=5)
+
+        # Lista de archivos
+        self.files_tree = ttk.Treeview(
+            files_frame,
+            columns=('Nombre', 'Tipo', 'Fecha'),
+            show='headings'
+        )
+        self.files_tree.heading('Nombre', text='Nombre del Archivo')
+        self.files_tree.heading('Tipo', text='Tipo')
+        self.files_tree.heading('Fecha', text='Fecha de Subida')
+        self.files_tree.pack(fill="both", expand=True)
+
+        # Botón para eliminar archivo
+        ttk.Button(
+            files_frame,
+            text="Eliminar Archivo Seleccionado",
+            command=self.delete_selected_file
+        ).pack(pady=10)
+
+        # Frame para administración (solo visible para administradores)
+        self.admin_frame = ttk.LabelFrame(self.user_panel_frame, text="Administración", padding="10")
+        
+        ttk.Button(
+            self.admin_frame,
+            text="Eliminar Usuario",
+            command=self.show_delete_user_dialog
+        ).pack(pady=5)
+
+        ttk.Button(
+            self.admin_frame,
+            text="Ver Todos los Usuarios",
+            command=self.show_users
+        ).pack(pady=5)
+
+    def show_login_frame(self):
+        self.user_panel_frame.pack_forget()
+        self.login_frame.pack(expand=True)
+
+    def show_user_panel(self):
+        self.login_frame.pack_forget()
+        self.user_panel_frame.pack(expand=True, fill="both")
+        self.user_label.config(text=f"Usuario: {self.current_user[1]}")
+        
+        # Mostrar panel de admin si el usuario es admin (primer usuario)
+        if self.current_user[0] == 1:
+            self.admin_frame.pack(fill="x", pady=10)
+        else:
+            self.admin_frame.pack_forget()
+            
+        self.refresh_files_list()
+
+    def refresh_files_list(self):
+        # Limpiar lista actual
+        for item in self.files_tree.get_children():
+            self.files_tree.delete(item)
+            
+        # Cargar archivos del usuario
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT original_name, file_type, upload_date
+                    FROM user_files
+                    WHERE user_id = ?
+                    ORDER BY upload_date DESC
+                ''', (self.current_user[0],))
+                
+                for file in cursor.fetchall():
+                    self.files_tree.insert('', 'end', values=file)
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al cargar la lista de archivos: {str(e)}")
+
+    def upload_file(self, extensions, file_type):
+        if not self.current_user:
+            return
+            
+        filetypes = [(f"Archivos {ext.upper()}", f"*.{ext}") for ext in extensions]
+        filetypes.append(("Todos los archivos", "*.*"))
+        
+        filename = filedialog.askopenfilename(
+            title=f"Seleccionar {file_type}",
+            filetypes=filetypes
+        )
+        
+        if filename:
+            try:
+                # Crear directorio del usuario si no existe
+                user_dir = Path(self.files_dir) / str(self.current_user[0])
+                user_dir.mkdir(exist_ok=True)
+                
+                # Copiar archivo
+                original_name = os.path.basename(filename)
+                new_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{original_name}"
+                destination = user_dir / new_filename
+                
+                shutil.copy2(filename, destination)
+                
+                # Guardar en la base de datos
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO user_files (user_id, filename, file_type, original_name)
+                        VALUES (?, ?, ?, ?)
+                    ''', (self.current_user[0], new_filename, file_type, original_name))
+                    conn.commit()
+                
+                self.refresh_files_list()
+                messagebox.showinfo("Éxito", "Archivo subido correctamente")
+            except Exception as e:
+                messagebox.showerror("Error", f"Error al subir el archivo: {str(e)}")
+
+    def delete_selected_file(self):
+        selected = self.files_tree.selection()
+        if not selected:
+            messagebox.showwarning("Aviso", "Por favor selecciona un archivo para eliminar")
+            return
+            
+        if messagebox.askyesno("Confirmar", "¿Estás seguro de que quieres eliminar este archivo?"):
+            try:
+                item = self.files_tree.item(selected[0])
+                original_name = item['values'][0]
+                
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        SELECT filename FROM user_files
+                        WHERE user_id = ? AND original_name = ?
+                    ''', (self.current_user[0], original_name))
+                    
+                    result = cursor.fetchone()
+                    if result:
+                        filename = result[0]
+                        file_path = Path(self.files_dir) / str(self.current_user[0]) / filename
+                        
+                        # Eliminar archivo físico
+                        if file_path.exists():
+                            os.remove(file_path)
+                        
+                        # Eliminar registro de la base de datos
+                        cursor.execute('''
+                            DELETE FROM user_files
+                            WHERE user_id = ? AND filename = ?
+                        ''', (self.current_user[0], filename))
+                        conn.commit()
+                        
+                        self.refresh_files_list()
+                        messagebox.showinfo("Éxito", "Archivo eliminado correctamente")
+            except Exception as e:
+                messagebox.showerror("Error", f"Error al eliminar el archivo: {str(e)}")
+
+    def show_delete_user_dialog(self):
+        if self.current_user[0] != 1:  # Solo el admin puede eliminar usuarios
+            return
+            
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Eliminar Usuario")
+        dialog.geometry("300x150")
+        
+        ttk.Label(
+            dialog,
+            text="Ingrese el correo del usuario a eliminar:",
+            wraplength=250
+        ).pack(pady=10)
+        
+        email_var = tk.StringVar()
+        ttk.Entry(dialog, textvariable=email_var).pack(pady=10)
+        
+        ttk.Button(
+            dialog,
+            text="Eliminar Usuario",
+            command=lambda: self.delete_user(email_var.get(), dialog)
+        ).pack(pady=10)
+
+    def delete_user(self, email, dialog=None):
+        if not email:
+            messagebox.showwarning("Aviso", "Por favor ingrese un correo electrónico")
+            return
+            
+        if email == self.current_user[1]:
+            messagebox.showwarning("Aviso", "No puedes eliminar tu propia cuenta de administrador")
+            return
+            
+        if messagebox.askyesno("Confirmar", f"¿Estás seguro de que quieres eliminar al usuario {email}?"):
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    
+                    # Obtener ID del usuario
+                    cursor.execute('SELECT id FROM users WHERE email = ?', (email,))
+                    user = cursor.fetchone()
+                    
+                    if not user:
+                        messagebox.showerror("Error", "Usuario no encontrado")
+                        return
+                        
+                    user_id = user[0]
+                    
+                    # Eliminar archivos físicos del usuario
+                    user_dir = Path(self.files_dir) / str(user_id)
+                    if user_dir.exists():
+                        shutil.rmtree(user_dir)
+                    
+                    # Eliminar usuario y sus archivos de la base de datos
+                    cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
+                    conn.commit()
+                    
+                    messagebox.showinfo("Éxito", f"Usuario {email} eliminado correctamente")
+                    if dialog:
+                        dialog.destroy()
+                        
+            except Exception as e:
+                messagebox.showerror("Error", f"Error al eliminar usuario: {str(e)}")
+
+    def show_db_info(self):
+        db_path = os.path.abspath(self.db_path)
+        if os.path.exists(db_path):
+            size = os.path.getsize(db_path)
+            print(f"\nInformación de la base de datos:")
+            print(f"Ubicación: {db_path}")
+            print(f"Tamaño: {size} bytes")
+            print("Estado: Base de datos creada y lista para usar")
+        else:
+            print("La base de datos aún no se ha creado")
+
+    def show_users(self):
+        if not self.current_user or self.current_user[0] != 1:
+            return
+            
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT u.email, u.created_at, COUNT(f.id) as num_files
+                    FROM users u
+                    LEFT JOIN user_files f ON u.id = f.user_id
+                    GROUP BY u.id, u.email, u.created_at
+                    ORDER BY u.created_at
+                ''')
+                users = cursor.fetchall()
+                
+                if users:
+                    user_list = "\n".join([
+                        f"Email: {user[0]}\n"
+                        f"Registrado: {user[1]}\n"
+                        f"Archivos: {user[2]}\n"
+                        f"{'=' * 30}"
+                        for user in users
+                    ])
+                    messagebox.showinfo(
+                        "Usuarios Registrados",
+                        f"Usuarios en la base de datos:\n\n{user_list}"
+                    )
+                else:
+                    messagebox.showinfo("Usuarios Registrados", "No hay usuarios registrados")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al consultar usuarios: {str(e)}")
+
+    def hash_password(self, password):
+        return hashlib.sha256(password.encode()).hexdigest()
+
+    def handle_submit(self):
+        email = self.email.get()
+        password = self.hash_password(self.password.get())
+
+        if not email or not self.password.get():
+            messagebox.showerror("Error", "Por favor completa todos los campos")
+            return
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                if self.is_login.get():  # Inicio de sesión
+                    cursor.execute('SELECT id, email FROM users WHERE email = ? AND password = ?', (email, password))
+                    user = cursor.fetchone()
+                    if user:
+                        self.current_user = user
+                        messagebox.showinfo("Éxito", "¡Inicio de sesión exitoso!")
+                        self.clear_fields()
+                        self.show_user_panel()
+                    else:
+                        messagebox.showerror("Error", "Credenciales incorrectas")
+                else:  # Registro
+                    cursor.execute('INSERT INTO users (email, password) VALUES (?, ?)', (email, password))
+                    conn.commit()
+                    messagebox.showinfo("Éxito", "¡Registro exitoso!")
+                    self.is_login.set(True)
+                    self.update_mode()
+                    self.clear_fields()
+
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Error", "El correo electrónico ya está registrado")
+        except Exception as e:
+            messagebox.showerror("Error", f"Ha ocurrido un error: {str(e)}")
+
+    def logout(self):
+        self.current_user = None
+        self.clear_fields()
+        self.show_login_frame()
+
+    def toggle_mode(self):
+        self.is_login.set(not self.is_login.get())
+        self.update_mode()
+        self.clear_fields()
+
+    def update_mode(self):
+        if self.is_login.get():
+            self.title_label.configure(text="Iniciar Sesión")
+            self.action_button.configure(text="Iniciar Sesión")
+            self.toggle_button.configure(text="¿No tienes una cuenta? Regístrate")
+        else:
+            self.title_label.configure(text="Registrarse")
+            self.action_button.configure(text="Registrarse")
+            self.toggle_button.configure(text="¿Ya tienes una cuenta? Inicia sesión")
+
+    def clear_fields(self):
+        self.email.set("")
+        self.password.set("")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = AuthApp(root)
+    root.mainloop()
