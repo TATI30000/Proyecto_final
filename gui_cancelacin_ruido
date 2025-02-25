@@ -1,491 +1,503 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-import sqlite3
-from pathlib import Path
-import hashlib
+from PIL import Image, ImageTk
+from tkinter import filedialog, messagebox
+from pydub import AudioSegment
+import numpy as np
+import pygame
+import tempfile
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import webbrowser
 import os
-import shutil
-from datetime import datetime
 
-class AuthApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Sistema de Gestión de Usuarios y Archivos")
-        self.root.geometry("800x600")
-        self.root.configure(bg="#f0f2f5")
+# Filtro de Kalman con implementación de fórmula
+class KalmanFilter:
+    def __init__(self, process_var, measurement_var):
+        self.process_var = process_var  # Q: Varianza del proceso
+        self.measurement_var = measurement_var  # R: Varianza de medición
+        self.estimate = 0.0  # Estimación inicial
+        self.error_cov = 1.0  # Covarianza del error inicial
 
-        # Variables de sesión
-        self.current_user = None
-        
-        # Configurar la base de datos y directorios
-        self.db_path = 'data/users.db'
-        self.files_dir = 'data/user_files'
-        self.setup_database()
-        
-        # Variables
-        self.is_login = tk.BooleanVar(value=True)
-        self.email = tk.StringVar()
-        self.password = tk.StringVar()
+    def apply(self, data):
+        filtered = []
+        for value in data:
+            # Predicción
+            self.error_cov += self.process_var  # Actualización de covarianza de error
+            kalman_gain = self.error_cov / (self.error_cov + self.measurement_var)  # Ganancia de Kalman
+            self.estimate += kalman_gain * (value - self.estimate)  # Actualización de la estimación
+            self.error_cov *= (1 - kalman_gain)  # Actualización de la covarianza de error
+            filtered.append(self.estimate)
+        return np.array(filtered)
 
-        # Crear interfaz
-        self.create_widgets()
-        
-        # Mostrar información de la base de datos
-        self.show_db_info()
+# Función de filtro de Promedio Móvil
+def filtro_promedio_movil(data, window_size):
+    return np.convolve(data, np.ones(window_size)/window_size, mode='same')
 
-    def setup_database(self):
-        # Crear directorios necesarios
-        Path("data").mkdir(exist_ok=True)
-        Path(self.files_dir).mkdir(exist_ok=True)
-        
-        print(f"Creando/conectando base de datos en: {os.path.abspath(self.db_path)}")
-        
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            # Tabla de usuarios
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    email TEXT UNIQUE NOT NULL,
-                    password TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            # Tabla de archivos
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_files (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    filename TEXT NOT NULL,
-                    file_type TEXT NOT NULL,
-                    original_name TEXT NOT NULL,
-                    upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-                )
-            ''')
-            conn.commit()
+# Función de filtro de Mediana
+def filtro_median(data, window_size):
+    return np.array([np.median(data[max(i - window_size // 2, 0): min(i + window_size // 2, len(data))]) for i in range(len(data))])
 
-    def create_widgets(self):
-        # Frame principal
-        self.main_frame = ttk.Frame(self.root, padding="20")
-        self.main_frame.pack(expand=True, fill="both")
+# Función para reproducir el audio
+def reproducir(audio):
+    if audio:
+        pygame.mixer.init()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+            ruta_temporal = temp_file.name
+            audio.export(ruta_temporal, format="wav")
+        pygame.mixer.music.load(ruta_temporal)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            root.update()
 
-        # Crear frames separados
-        self.login_frame = ttk.Frame(self.main_frame)
-        self.user_panel_frame = ttk.Frame(self.main_frame)
-        
-        self.create_login_widgets()
-        self.create_user_panel_widgets()
-        
-        # Mostrar frame de login inicialmente
-        self.show_login_frame()
+# Función para guardar el audio filtrado
+def guardar_audio():
+    if audio_filtrado:
+        ruta = filedialog.asksaveasfilename(defaultextension=".wav", filetypes=[("Archivos WAV", "*.wav")])
+        if ruta:
+            audio_filtrado.export(ruta, format="wav")
+            messagebox.showinfo("Éxito", "Audio guardado correctamente.")
 
-    def create_login_widgets(self):
-        # Estilo para los widgets
-        style = ttk.Style()
-        style.configure("TLabel", font=("Helvetica", 12))
-        style.configure("TEntry", font=("Helvetica", 11))
-        style.configure("TButton", font=("Helvetica", 11))
+# Variables globales
+audio = audio_ruido = audio_filtrado = None
+escala_ruido = escala_proc = escala_meas = None
+filtro_seleccionado = None
+es_audio_con_ruido = False
 
-        # Título
-        self.title_label = ttk.Label(
-            self.login_frame,
-            text="Iniciar Sesión",
-            font=("Helvetica", 20, "bold")
-        )
-        self.title_label.pack(pady=(0, 20))
+# Ventana para seleccionar el tipo de audio (con ruido o sin ruido)
+def ventana_seleccion_audio():
+    def seleccionar_sin_ruido():
+        global es_audio_con_ruido
+        es_audio_con_ruido = False
+        ventana.destroy()
+        ventana_cargar_audio()
 
-        # Email
-        ttk.Label(self.login_frame, text="Correo electrónico:").pack(anchor="w")
-        email_entry = ttk.Entry(self.login_frame, textvariable=self.email, width=40)
-        email_entry.pack(pady=(0, 15), fill="x")
+    def seleccionar_con_ruido():
+        global es_audio_con_ruido
+        es_audio_con_ruido = True
+        ventana.destroy()
+        ventana_cargar_audio()
 
-        # Contraseña
-        ttk.Label(self.login_frame, text="Contraseña:").pack(anchor="w")
-        password_entry = ttk.Entry(self.login_frame, textvariable=self.password, show="•", width=40)
-        password_entry.pack(pady=(0, 20), fill="x")
+    ventana = tk.Toplevel(root)
+    ventana.title("Seleccionar Tipo de Audio")
+    ventana.geometry("400x200")
 
-        # Botón de acción
-        self.action_button = ttk.Button(
-            self.login_frame,
-            text="Iniciar Sesión",
-            command=self.handle_submit,
-            width=39
-        )
-        self.action_button.pack(pady=(0, 15))
+    # Centrar la ventana en la pantalla
+    centrar_ventana(ventana, 400, 200)
 
-        # Botón para cambiar entre login y registro
-        self.toggle_button = ttk.Button(
-            self.login_frame,
-            text="¿No tienes una cuenta? Regístrate",
-            command=self.toggle_mode,
-            width=39
-        )
-        self.toggle_button.pack(pady=(0, 15))
+    tk.Label(ventana, text="¿Qué tipo de audio deseas cargar?").pack(pady=20)
+    tk.Button(ventana, text="Audio sin ruido", command=seleccionar_sin_ruido).pack(pady=10)
+    tk.Button(ventana, text="Audio con ruido", command=seleccionar_con_ruido).pack(pady=10)
 
-    def create_user_panel_widgets(self):
-        # Frame superior para información del usuario
-        top_frame = ttk.Frame(self.user_panel_frame)
-        top_frame.pack(fill="x", pady=(0, 20))
-        
-        self.user_label = ttk.Label(
-            top_frame,
-            text="",
-            font=("Helvetica", 14, "bold")
-        )
-        self.user_label.pack(side="left")
-        
-        ttk.Button(
-            top_frame,
-            text="Cerrar Sesión",
-            command=self.logout
-        ).pack(side="right")
+# Función para centrar ventanas
+def centrar_ventana(ventana, ancho, alto):
+    # Obtén las dimensiones de la pantalla
+    pantalla_ancho = ventana.winfo_screenwidth()
+    pantalla_alto = ventana.winfo_screenheight()
+    
+    # Calcula la posición para centrar la ventana
+    x = (pantalla_ancho - ancho) // 2
+    y = (pantalla_alto - alto) // 2
+    
+    # Configura el tamaño y posición de la ventana
+    ventana.geometry(f"{ancho}x{alto}+{x}+{y}")
 
-        # Frame para la gestión de archivos
-        files_frame = ttk.LabelFrame(self.user_panel_frame, text="Gestión de Archivos", padding="10")
-        files_frame.pack(fill="both", expand=True)
+# Función para graficar audio
+def graficar_audio(audio_graficar, ax, titulo):
+    muestras = np.array(audio_graficar.get_array_of_samples())
+    tiempo = np.linspace(0, len(muestras) / audio_graficar.frame_rate, num=len(muestras))
 
-        # Botones para subir archivos
-        buttons_frame = ttk.Frame(files_frame)
-        buttons_frame.pack(fill="x", pady=(0, 10))
+    ax.plot(tiempo, muestras, color="blue")
+    ax.set_title(titulo)
+    ax.set_xlabel("Tiempo (s)")
+    ax.set_ylabel("Amplitud")
 
-        ttk.Button(
-            buttons_frame,
-            text="Subir Imagen",
-            command=lambda: self.upload_file(['png', 'jpg', 'jpeg', 'gif'], 'imagen')
-        ).pack(side="left", padx=5)
-
-        ttk.Button(
-            buttons_frame,
-            text="Subir Texto",
-            command=lambda: self.upload_file(['txt', 'doc', 'docx'], 'texto')
-        ).pack(side="left", padx=5)
-
-        ttk.Button(
-            buttons_frame,
-            text="Subir Audio",
-            command=lambda: self.upload_file(['mp3', 'wav'], 'audio')
-        ).pack(side="left", padx=5)
-
-        # Lista de archivos
-        self.files_tree = ttk.Treeview(
-            files_frame,
-            columns=('Nombre', 'Tipo', 'Fecha'),
-            show='headings'
-        )
-        self.files_tree.heading('Nombre', text='Nombre del Archivo')
-        self.files_tree.heading('Tipo', text='Tipo')
-        self.files_tree.heading('Fecha', text='Fecha de Subida')
-        self.files_tree.pack(fill="both", expand=True)
-
-        # Botón para eliminar archivo
-        ttk.Button(
-            files_frame,
-            text="Eliminar Archivo Seleccionado",
-            command=self.delete_selected_file
-        ).pack(pady=10)
-
-        # Frame para administración (solo visible para administradores)
-        self.admin_frame = ttk.LabelFrame(self.user_panel_frame, text="Administración", padding="10")
-        
-        ttk.Button(
-            self.admin_frame,
-            text="Eliminar Usuario",
-            command=self.show_delete_user_dialog
-        ).pack(pady=5)
-
-        ttk.Button(
-            self.admin_frame,
-            text="Ver Todos los Usuarios",
-            command=self.show_users
-        ).pack(pady=5)
-
-    def show_login_frame(self):
-        self.user_panel_frame.pack_forget()
-        self.login_frame.pack(expand=True)
-
-    def show_user_panel(self):
-        self.login_frame.pack_forget()
-        self.user_panel_frame.pack(expand=True, fill="both")
-        self.user_label.config(text=f"Usuario: {self.current_user[1]}")
-        
-        # Mostrar panel de admin si el usuario es admin (primer usuario)
-        if self.current_user[0] == 1:
-            self.admin_frame.pack(fill="x", pady=10)
-        else:
-            self.admin_frame.pack_forget()
+# Ventana 1: Cargar audio
+def ventana_cargar_audio():
+    def cargar_audio():
+        global audio
+        ruta = filedialog.askopenfilename(filetypes=[("Archivos de audio", "*.mp3;*.wav")])
+        if ruta:
+            audio = AudioSegment.from_file(ruta)
             
-        self.refresh_files_list()
-
-    def refresh_files_list(self):
-        # Limpiar lista actual
-        for item in self.files_tree.get_children():
-            self.files_tree.delete(item)
-            
-        # Cargar archivos del usuario
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT original_name, file_type, upload_date
-                    FROM user_files
-                    WHERE user_id = ?
-                    ORDER BY upload_date DESC
-                ''', (self.current_user[0],))
+            # Limitar la duración del audio a 10 segundos
+            duracion_maxima = 10 * 1000  # 10 segundos en milisegundos
+            if len(audio) > duracion_maxima:
+                audio = audio[:duracion_maxima]
                 
-                for file in cursor.fetchall():
-                    self.files_tree.insert('', 'end', values=file)
-        except Exception as e:
-            messagebox.showerror("Error", f"Error al cargar la lista de archivos: {str(e)}")
+            messagebox.showinfo("Éxito", "Audio cargado correctamente.")
+            ventana.destroy()
+            if es_audio_con_ruido:  # Omitir paso de agregar ruido
+                global audio_ruido
+                audio_ruido = audio  # Usar el audio original para el filtro
+                ventana_tipo_filtro()
+            else:
+                ventana_grafica_original()
 
-    def upload_file(self, extensions, file_type):
-        if not self.current_user:
-            return
-            
-        filetypes = [(f"Archivos {ext.upper()}", f"*.{ext}") for ext in extensions]
-        filetypes.append(("Todos los archivos", "*.*"))
+
+    ventana = tk.Toplevel(root)
+    ventana.title("Cargar Audio")
+    ventana.geometry("800x600")
+
+    # Centrar la ventana en la pantalla
+    centrar_ventana(ventana, 800, 600)
+
+    # Cargar imagen de fondo
+    imagen_fondo = Image.open("Aves.png")  
+    imagen_fondo = imagen_fondo.resize((700, 600), Image.LANCZOS)  
+    fondo_tk = ImageTk.PhotoImage(imagen_fondo)
+
+    # Agregar imagen de fondo con Label y bajarla
+    label_fondo = tk.Label(ventana, image=fondo_tk)
+    label_fondo.place(x=70, y=50)  # Ajusta los valores de x (horizontal) y y (vertical)
+
+    # Asegurar que la imagen no sea eliminada por el recolector de basura
+    label_fondo.image = fondo_tk
+
+
+    tk.Label(ventana, text="Paso 1: Cargar un archivo de audio").pack(pady=10)
+    tk.Button(ventana, text="Cargar Audio", command=cargar_audio).pack(pady=10)
+
+# Función para centrar ventanas
+def centrar_ventana(ventana, ancho, alto):
+    # Obtén las dimensiones de la pantalla
+    pantalla_ancho = ventana.winfo_screenwidth()
+    pantalla_alto = ventana.winfo_screenheight()
+    
+    # Calcula la posición para centrar la ventana
+    x = (pantalla_ancho - ancho) // 2
+    y = (pantalla_alto - alto) // 2
+    
+    # Configura el tamaño y posición de la ventana
+    ventana.geometry(f"{ancho}x{alto}+{x}+{y}")
+
+
+# Ventana 2: Mostrar gráfica del audio original y agregar ruido
+def ventana_grafica_original():
+    def agregar_ruido():
+        global audio_ruido
+        tipo = "blanco"
+        ruido = np.random.normal(0, 1, int(audio.frame_rate * len(audio) / 1000))
+        ruido = (ruido * 32767 * escala_ruido.get() / 100).astype(np.int16)
+        audio_ruido = audio.overlay(AudioSegment(ruido.tobytes(), frame_rate=audio.frame_rate, sample_width=2, channels=1))
+        messagebox.showinfo("Éxito", "Ruido agregado correctamente.")
+
+    ventana = tk.Toplevel(root)
+    ventana.title("Gráfica del Audio Original y Agregar Ruido")
+    ventana.geometry("800x600")
+
+    # Centrar la ventana en la pantalla
+    centrar_ventana(ventana, 800, 600)
+
+    tk.Label(ventana, text="Paso 2: Gráfica del Audio Original").pack(pady=10)
+
+    # Frame para la gráfica del audio original y el botón
+    frame_original = tk.Frame(ventana)
+    frame_original.pack(pady=20)
+
+    fig, ax = plt.subplots(figsize=(5, 3))  # Tamaño reducido de la gráfica
+    graficar_audio(audio, ax, "Audio Original")
+    canvas = FigureCanvasTkAgg(fig, master=frame_original)
+    canvas.get_tk_widget().pack()
+    canvas.draw()
+
+    escala_ruido = tk.Scale(ventana, from_=0, to=100, label="Intensidad Ruido", orient="horizontal")
+    escala_ruido.pack(pady=10)
+
+    tk.Button(frame_original, text="Agregar Ruido", command=agregar_ruido).pack(pady=10)
+    tk.Button(ventana, text="Siguiente", command=ventana_tipo_filtro).pack(pady=20)
+
+# Función para centrar ventanas (si aún no la has definido)
+def centrar_ventana(ventana, ancho, alto):
+    # Obtén las dimensiones de la pantalla
+    pantalla_ancho = ventana.winfo_screenwidth()
+    pantalla_alto = ventana.winfo_screenheight()
+    
+    # Calcula la posición para centrar la ventana
+    x = (pantalla_ancho - ancho) // 2
+    y = (pantalla_alto - alto) // 2
+    
+    # Configura el tamaño y posición de la ventana
+    ventana.geometry(f"{ancho}x{alto}+{x}+{y}")
+
+# Ventana 3: Elección del filtro y mostrar fórmula
+def ventana_tipo_filtro():
+    def elegir_filtro():
+        global filtro_seleccionado
+        filtro_seleccionado = filtro_var.get()
+        ventana.destroy()
+        ventana_aplicar_filtro()
+
+    ventana = tk.Toplevel(root)
+    ventana.title("Seleccionar Tipo de Filtro")
+    ventana.geometry("800x600")
+
+    # Centrar la ventana en la pantalla
+    centrar_ventana(ventana, 800, 600)
+
+    # Cargar imagen de fondo
+    imagen_fondo = Image.open("Aplicar.png")  
+    imagen_fondo = imagen_fondo.resize((300, 350), Image.LANCZOS)  
+    fondo_tk = ImageTk.PhotoImage(imagen_fondo)
+
+    # Agregar imagen de fondo con Label y bajarla
+    label_fondo = tk.Label(ventana, image=fondo_tk)
+    label_fondo.place(x=250, y=220)  # Ajusta los valores de x (horizontal) y y (vertical)
+
+    # Asegurar que la imagen no sea eliminada por el recolector de basura
+    label_fondo.image = fondo_tk
+
+    tk.Label(ventana, text="Paso 3: Seleccionar el tipo de filtro a aplicar").pack(pady=10)
+
+    filtro_var = tk.StringVar()
+
+    # Radio buttons para elegir el filtro
+    tk.Radiobutton(ventana, text="Filtro Kalman", variable=filtro_var, value="Kalman").pack(pady=5)
+    tk.Radiobutton(ventana, text="Filtro Promedio Móvil", variable=filtro_var, value="Promedio Móvil").pack(pady=5)
+    tk.Radiobutton(ventana, text="Filtro Mediana", variable=filtro_var, value="Mediana").pack(pady=5)
+
+    tk.Button(ventana, text="Seleccionar Filtro", command=elegir_filtro).pack(pady=20)
+
+# Función para centrar ventanas (si aún no la has definido)
+def centrar_ventana(ventana, ancho, alto):
+    # Obtén las dimensiones de la pantalla
+    pantalla_ancho = ventana.winfo_screenwidth()
+    pantalla_alto = ventana.winfo_screenheight()
+    
+    # Calcula la posición para centrar la ventana
+    x = (pantalla_ancho - ancho) // 2
+    y = (pantalla_alto - alto) // 2
+    
+    # Configura el tamaño y posición de la ventana
+    ventana.geometry(f"{ancho}x{alto}+{x}+{y}")
+
+# Ventana 4: Gráficas y aplicar filtro
+def ventana_aplicar_filtro():
+    def aplicar_filtro():
+        global audio_filtrado
+        muestras = np.array(audio_ruido.get_array_of_samples())
         
-        filename = filedialog.askopenfilename(
-            title=f"Seleccionar {file_type}",
-            filetypes=filetypes
-        )
+        if filtro_seleccionado == "Kalman":
+            kalman = KalmanFilter(escala_proc.get() / 1000, escala_meas.get() / 1000)
+            filtrado = kalman.apply(muestras).astype(np.int16)
+        elif filtro_seleccionado == "Promedio Móvil":
+            window_size = escala_proc.get()
+            filtrado = filtro_promedio_movil(muestras, window_size=window_size).astype(np.int16)
+        elif filtro_seleccionado == "Mediana":
+            window_size = escala_proc.get()
+            filtrado = filtro_median(muestras, window_size=window_size).astype(np.int16)
+
+        audio_filtrado = AudioSegment(filtrado.tobytes(), frame_rate=audio.frame_rate, sample_width=2, channels=1)
         
-        if filename:
-            try:
-                # Crear directorio del usuario si no existe
-                user_dir = Path(self.files_dir) / str(self.current_user[0])
-                user_dir.mkdir(exist_ok=True)
-                
-                # Copiar archivo
-                original_name = os.path.basename(filename)
-                new_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{original_name}"
-                destination = user_dir / new_filename
-                
-                shutil.copy2(filename, destination)
-                
-                # Guardar en la base de datos
-                with sqlite3.connect(self.db_path) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        INSERT INTO user_files (user_id, filename, file_type, original_name)
-                        VALUES (?, ?, ?, ?)
-                    ''', (self.current_user[0], new_filename, file_type, original_name))
-                    conn.commit()
-                
-                self.refresh_files_list()
-                messagebox.showinfo("Éxito", "Archivo subido correctamente")
-            except Exception as e:
-                messagebox.showerror("Error", f"Error al subir el archivo: {str(e)}")
+        messagebox.showinfo("Éxito", f"Filtro {filtro_seleccionado} aplicado.")
+        ventana.destroy()
+        ventana_grafica_filtrada()
 
-    def delete_selected_file(self):
-        selected = self.files_tree.selection()
-        if not selected:
-            messagebox.showwarning("Aviso", "Por favor selecciona un archivo para eliminar")
-            return
-            
-        if messagebox.askyesno("Confirmar", "¿Estás seguro de que quieres eliminar este archivo?"):
-            try:
-                item = self.files_tree.item(selected[0])
-                original_name = item['values'][0]
-                
-                with sqlite3.connect(self.db_path) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        SELECT filename FROM user_files
-                        WHERE user_id = ? AND original_name = ?
-                    ''', (self.current_user[0], original_name))
-                    
-                    result = cursor.fetchone()
-                    if result:
-                        filename = result[0]
-                        file_path = Path(self.files_dir) / str(self.current_user[0]) / filename
-                        
-                        # Eliminar archivo físico
-                        if file_path.exists():
-                            os.remove(file_path)
-                        
-                        # Eliminar registro de la base de datos
-                        cursor.execute('''
-                            DELETE FROM user_files
-                            WHERE user_id = ? AND filename = ?
-                        ''', (self.current_user[0], filename))
-                        conn.commit()
-                        
-                        self.refresh_files_list()
-                        messagebox.showinfo("Éxito", "Archivo eliminado correctamente")
-            except Exception as e:
-                messagebox.showerror("Error", f"Error al eliminar el archivo: {str(e)}")
+    ventana = tk.Toplevel(root)
+    ventana.title("Aplicar Filtro")
+    ventana.geometry("800x600")
 
-    def show_delete_user_dialog(self):
-        if self.current_user[0] != 1:  # Solo el admin puede eliminar usuarios
-            return
-            
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Eliminar Usuario")
-        dialog.geometry("300x150")
+    # Centrar la ventana en la pantalla
+    centrar_ventana(ventana, 800, 600)
+
+    # Cargar imagen de fondo
+    imagen_fondo = Image.open("Filtro1.png")  
+    imagen_fondo = imagen_fondo.resize((780, 570), Image.LANCZOS)  
+    fondo_tk = ImageTk.PhotoImage(imagen_fondo)
+
+    # Agregar imagen de fondo con Label y bajarla
+    label_fondo = tk.Label(ventana, image=fondo_tk)
+    label_fondo.place(x=5, y=20)  # Ajusta los valores de x (horizontal) y y (vertical)
+
+    # Asegurar que la imagen no sea eliminada por el recolector de basura
+    label_fondo.image = fondo_tk
+
+    # Cargar imagen de fondo
+    imagen_fondo = Image.open("Filtro2.png")  
+    imagen_fondo = imagen_fondo.resize((600, 370), Image.LANCZOS)  
+    fondo_tk = ImageTk.PhotoImage(imagen_fondo)
+
+    # Agregar imagen de fondo con Label y bajarla
+    label_fondo = tk.Label(ventana, image=fondo_tk)
+    label_fondo.place(x=-10, y=20)  # Ajusta los valores de x (horizontal) y y (vertical)
+
+    # Asegurar que la imagen no sea eliminada por el recolector de basura
+    label_fondo.image = fondo_tk
+    # Contenedor para centrar elementos
+    frame = tk.Frame(ventana)
+    frame.pack(expand=True)
+
+# Etiqueta del título centrado
+    tk.Label(frame, text="Paso 4: Aplicar el Filtro").pack(pady=10)
+
+# Mostrar la fórmula del filtro seleccionado
+    if filtro_seleccionado == "Kalman":
+     formula = "Kalman: Estimación = Estimación + (Ganancia de Kalman * (Valor medido - Estimación))"
+    elif filtro_seleccionado == "Promedio Móvil":
+     formula = "Promedio Móvil: Valor filtrado = Promedio de los valores vecinos en la ventana."
+    elif filtro_seleccionado == "Mediana":
+     formula = "Mediana: Valor filtrado = Mediana de los valores en la ventana."
+    else:
+     formula = "Selección de filtro no válida"
+
+# Etiqueta de la fórmula centrada
+    label_formula = tk.Label(frame, text=formula, wraplength=700, justify="center")
+    label_formula.pack(pady=20)
+
+# Escalas de varianza
+    global escala_proc, escala_meas
+
+# Escala para el tamaño de la ventana o varianza
+    escala_proc = tk.Scale(frame, from_=1, to=100, length=400, label="Tamaño de Ventana o Varianza", orient="horizontal")
+    escala_proc.pack(pady=10)
+
+# Escala para la varianza de medición
+    escala_meas = tk.Scale(frame, from_=1, to=100, length=400, label="Varianza de Medición", orient="horizontal")
+    escala_meas.pack(pady=10)
+
+# Botón para aplicar el filtro centrado
+    tk.Button(frame, text="Aplicar Filtro", command=aplicar_filtro).pack(pady=20)
+
+# Función para centrar ventanas
+def centrar_ventana(ventana, ancho, alto):
+    # Obtén las dimensiones de la pantalla
+    pantalla_ancho = ventana.winfo_screenwidth()
+    pantalla_alto = ventana.winfo_screenheight()
+    
+    # Calcula la posición para centrar la ventana
+    x = (pantalla_ancho - ancho) // 2
+    y = (pantalla_alto - alto) // 2
+    
+    # Configura el tamaño y posición de la ventana
+    ventana.geometry(f"{ancho}x{alto}+{x}+{y}")
+
+# Ventana 5: Gráficas del audio original, con ruido y filtrado con botones de reproducción y guardar
+def ventana_grafica_filtrada():
+    ventana = tk.Toplevel(root)
+    ventana.title("Audio Filtrado")
+    ventana.geometry("800x600")
+
+    # Centrar la ventana en la pantalla
+    centrar_ventana(ventana, 800, 600)
+
+    tk.Label(ventana, text="Paso 5: Gráficas de los Audios").pack(pady=10)
+
+        # Crear una figura con subgráficas de acuerdo a la opción seleccionada
+    if es_audio_con_ruido:
+        fig, axs = plt.subplots(1, 2, figsize=(12, 4))  # Solo dos gráficas: Original y Filtrado
+        fig.subplots_adjust(hspace=0.5)
         
-        ttk.Label(
-            dialog,
-            text="Ingrese el correo del usuario a eliminar:",
-            wraplength=250
-        ).pack(pady=10)
+        # Graficar solo dos audios si el audio ya tiene ruido
+        graficar_audio(audio, axs[0], "Audio Original")
+        graficar_audio(audio_filtrado, axs[1], "Audio Filtrado")
+    else:
+        fig, axs = plt.subplots(1, 3, figsize=(12, 4))  # Tres gráficas: Original, Ruido y Filtrado
+        fig.subplots_adjust(hspace=0.5)
         
-        email_var = tk.StringVar()
-        ttk.Entry(dialog, textvariable=email_var).pack(pady=10)
-        
-        ttk.Button(
-            dialog,
-            text="Eliminar Usuario",
-            command=lambda: self.delete_user(email_var.get(), dialog)
-        ).pack(pady=10)
+        # Graficar los tres audios si el ruido se agregó manualmente
+        graficar_audio(audio, axs[0], "Audio Original")
+        graficar_audio(audio_ruido, axs[1], "Audio con Ruido")
+        graficar_audio(audio_filtrado, axs[2], "Audio Filtrado")
 
-    def delete_user(self, email, dialog=None):
-        if not email:
-            messagebox.showwarning("Aviso", "Por favor ingrese un correo electrónico")
-            return
-            
-        if email == self.current_user[1]:
-            messagebox.showwarning("Aviso", "No puedes eliminar tu propia cuenta de administrador")
-            return
-            
-        if messagebox.askyesno("Confirmar", f"¿Estás seguro de que quieres eliminar al usuario {email}?"):
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    cursor = conn.cursor()
-                    
-                    # Obtener ID del usuario
-                    cursor.execute('SELECT id FROM users WHERE email = ?', (email,))
-                    user = cursor.fetchone()
-                    
-                    if not user:
-                        messagebox.showerror("Error", "Usuario no encontrado")
-                        return
-                        
-                    user_id = user[0]
-                    
-                    # Eliminar archivos físicos del usuario
-                    user_dir = Path(self.files_dir) / str(user_id)
-                    if user_dir.exists():
-                        shutil.rmtree(user_dir)
-                    
-                    # Eliminar usuario y sus archivos de la base de datos
-                    cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
-                    conn.commit()
-                    
-                    messagebox.showinfo("Éxito", f"Usuario {email} eliminado correctamente")
-                    if dialog:
-                        dialog.destroy()
-                        
-            except Exception as e:
-                messagebox.showerror("Error", f"Error al eliminar usuario: {str(e)}")
+    # Mostrar la figura con las tres gráficas
+    canvas = FigureCanvasTkAgg(fig, master=ventana)
+    canvas.get_tk_widget().pack()
+    canvas.draw()
 
-    def show_db_info(self):
-        db_path = os.path.abspath(self.db_path)
-        if os.path.exists(db_path):
-            size = os.path.getsize(db_path)
-            print(f"\nInformación de la base de datos:")
-            print(f"Ubicación: {db_path}")
-            print(f"Tamaño: {size} bytes")
-            print("Estado: Base de datos creada y lista para usar")
-        else:
-            print("La base de datos aún no se ha creado")
+    # Frame para los botones de reproducción debajo de cada gráfica
+    frame_botones = tk.Frame(ventana)
+    frame_botones.pack(side="bottom", pady=10)
 
-    def show_users(self):
-        if not self.current_user or self.current_user[0] != 1:
-            return
-            
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT u.email, u.created_at, COUNT(f.id) as num_files
-                    FROM users u
-                    LEFT JOIN user_files f ON u.id = f.user_id
-                    GROUP BY u.id, u.email, u.created_at
-                    ORDER BY u.created_at
-                ''')
-                users = cursor.fetchall()
-                
-                if users:
-                    user_list = "\n".join([
-                        f"Email: {user[0]}\n"
-                        f"Registrado: {user[1]}\n"
-                        f"Archivos: {user[2]}\n"
-                        f"{'=' * 30}"
-                        for user in users
-                    ])
-                    messagebox.showinfo(
-                        "Usuarios Registrados",
-                        f"Usuarios en la base de datos:\n\n{user_list}"
-                    )
-                else:
-                    messagebox.showinfo("Usuarios Registrados", "No hay usuarios registrados")
-        except Exception as e:
-            messagebox.showerror("Error", f"Error al consultar usuarios: {str(e)}")
+    # Reproducir audio original
+    frame_original = tk.Frame(frame_botones)
+    frame_original.pack(pady=5)
+    tk.Button(frame_original, text="Reproducir Original", command=lambda: reproducir(audio)).pack()
 
-    def hash_password(self, password):
-        return hashlib.sha256(password.encode()).hexdigest()
+    # Reproducir audio filtrado
+    frame_filtrado = tk.Frame(frame_botones)
+    frame_filtrado.pack(pady=5)
+    tk.Button(frame_filtrado, text="Reproducir Filtrado", command=lambda: reproducir(audio_filtrado)).pack()
 
-    def handle_submit(self):
-        email = self.email.get()
-        password = self.hash_password(self.password.get())
+    # Botón para guardar el audio filtrado
+    tk.Button(frame_botones, text="Guardar Audio", command=guardar_audio).pack(pady=10)
 
-        if not email or not self.password.get():
-            messagebox.showerror("Error", "Por favor completa todos los campos")
-            return
+# Función para centrar ventanas
+def centrar_ventana(ventana, ancho, alto):
+    # Obtén las dimensiones de la pantalla
+    pantalla_ancho = ventana.winfo_screenwidth()
+    pantalla_alto = ventana.winfo_screenheight()
+    
+    # Calcula la posición para centrar la ventana
+    x = (pantalla_ancho - ancho) // 2
+    y = (pantalla_alto - alto) // 2
+    
+    # Configura el tamaño y posición de la ventana
+    ventana.geometry(f"{ancho}x{alto}+{x}+{y}")
 
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                if self.is_login.get():  # Inicio de sesión
-                    cursor.execute('SELECT id, email FROM users WHERE email = ? AND password = ?', (email, password))
-                    user = cursor.fetchone()
-                    if user:
-                        self.current_user = user
-                        messagebox.showinfo("Éxito", "¡Inicio de sesión exitoso!")
-                        self.clear_fields()
-                        self.show_user_panel()
-                    else:
-                        messagebox.showerror("Error", "Credenciales incorrectas")
-                else:  # Registro
-                    cursor.execute('INSERT INTO users (email, password) VALUES (?, ?)', (email, password))
-                    conn.commit()
-                    messagebox.showinfo("Éxito", "¡Registro exitoso!")
-                    self.is_login.set(True)
-                    self.update_mode()
-                    self.clear_fields()
+root = tk.Tk()
+root.title("Procesador de Audio con Filtro")
+root.geometry("1200x700")  # Ajusta el tamaño según necesites
 
-        except sqlite3.IntegrityError:
-            messagebox.showerror("Error", "El correo electrónico ya está registrado")
-        except Exception as e:
-            messagebox.showerror("Error", f"Ha ocurrido un error: {str(e)}")
+def abrir_link():
+    webbrowser.open("https://www.pngwing.com/es/search?q=ayuda")
 
-    def logout(self):
-        self.current_user = None
-        self.clear_fields()
-        self.show_login_frame()
+# Ruta de la imagen
+ruta_imagen = "Ayuda.png"
 
-    def toggle_mode(self):
-        self.is_login.set(not self.is_login.get())
-        self.update_mode()
-        self.clear_fields()
+if os.path.exists(ruta_imagen):
+    # Cargar y redimensionar la imagen
+    icono_img = Image.open(ruta_imagen)
+    icono_img = icono_img.resize((35, 35), Image.LANCZOS)
+    icono_tk = ImageTk.PhotoImage(icono_img)
 
-    def update_mode(self):
-        if self.is_login.get():
-            self.title_label.configure(text="Iniciar Sesión")
-            self.action_button.configure(text="Iniciar Sesión")
-            self.toggle_button.configure(text="¿No tienes una cuenta? Regístrate")
-        else:
-            self.title_label.configure(text="Registrarse")
-            self.action_button.configure(text="Registrarse")
-            self.toggle_button.configure(text="¿Ya tienes una cuenta? Inicia sesión")
+    # Guardar referencia globalmente
+    root.icono_tk = icono_tk  
 
-    def clear_fields(self):
-        self.email.set("")
-        self.password.set("")
+    # Crear botón con la imagen
+    boton_icono = tk.Button(root, image=root.icono_tk, command=abrir_link, borderwidth=0)
+    boton_icono.place(x=1310, y=650)  # Ajusta la posición en la ventana
 
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = AuthApp(root)
-    root.mainloop()
+else:
+    print(f"Error: No se encontró la imagen '{ruta_imagen}'")
+
+# Cargar y redimensionar la imagen
+img = Image.open("LogoU.png")  # Ruta de la imagen
+img = img.resize((1200, 450))  # Cambiar tamaño (ancho, alto) en píxeles
+img_tk = ImageTk.PhotoImage(img)
+
+# Crear un Label para la imagen y centrarla
+label_img = tk.Label(root, image=img_tk)
+
+# Función para centrar la imagen
+def centrar_imagen():
+    # Obtener el tamaño de la ventana
+    window_width = root.winfo_width()
+    window_height = root.winfo_height()
+
+    # Obtener el tamaño de la imagen
+    img_width = img.width
+    img_height = img.height
+
+    # Calcular las coordenadas para centrar la imagen
+    x = (window_width - img_width) // 2
+    y = (window_height - img_height) // 2
+
+    # Posicionar la imagen
+    label_img.place(x=x, y=y, width=img_width, height=img_height)
+
+# Configurar la ventana para iniciar maximizada
+root.state('zoomed')  # Abrir en modo maximizado (sin ocultar la barra de título)
+
+# Llamar a la función para centrar la imagen
+root.after(100, centrar_imagen)
+
+# Función para salir del modo maximizado (opcional, en caso de que se desee)
+def salir_maximizado(event=None):
+    root.state('normal')  # Regresa al tamaño normal
+
+# Asociar la tecla Esc para salir del modo maximizado
+root.bind("<Escape>", salir_maximizado)
+
+# Configuración de la ventana inicial
+tk.Label(root, text="Procesador de Audio con Filtro").pack(pady=20)
+tk.Button(root, text="Iniciar", command=ventana_seleccion_audio).pack()
+root.mainloop()
